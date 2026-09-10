@@ -767,6 +767,17 @@ export class ReolinkBaichuanApi {
       "[ReolinkBaichuanApi] General socket reconnected successfully",
     );
 
+    // A reconnect invalidates any stream-profile rejections recorded during
+    // the outage — those 400s reflect the disconnect, not genuine firmware
+    // capability, and would otherwise be excluded until their TTL expires.
+    if (this._rejectedStreamProfiles.size > 0) {
+      this.logger.log?.(
+        `[ReolinkBaichuanApi] Clearing ${this._rejectedStreamProfiles.size} stream profile rejection(s) after reconnect`,
+      );
+      this._rejectedStreamProfiles.clear();
+      this.videoStreamOptionsCache.clear();
+    }
+
     // Re-subscribe to events if there are registered listeners.
     // After reconnection the old subscription is gone (old socket destroyed),
     // so we need to re-send the subscribe command on the new socket.
@@ -1699,19 +1710,30 @@ export class ReolinkBaichuanApi {
   }
 
   /**
-   * Stream profiles that the device explicitly rejected (response_code 400).
-   * Keyed by `"ch:profile"` (e.g. `"0:ext"`). Once a profile is in this set
-   * it is excluded from `buildVideoStreamOptions()` results and no further
-   * start attempts are made until the API instance is recreated.
+   * Stream profiles that the device explicitly rejected (response_code 400),
+   * keyed by "ch:profile" (e.g. "0:ext") mapping to the timestamp the
+   * rejection was recorded. A profile is only excluded from
+   * `buildVideoStreamOptions()` while its entry is within
+   * REJECTED_STREAM_PROFILE_TTL_MS — after that it's given a fresh chance,
+   * since a 400 here usually reflects a transient disconnect/reconnect
+   * rather than a genuine, permanent firmware limitation.
    */
-  private readonly _rejectedStreamProfiles = new Set<string>();
+  private readonly _rejectedStreamProfiles = new Map<string, number>();
+  private static readonly REJECTED_STREAM_PROFILE_TTL_MS = 3 * 60 * 1000;
 
   /**
    * Check whether a stream profile was rejected by the device at runtime
-   * (e.g. ext returned response_code 400).
+   * (e.g. ext returned response_code 400), and the rejection hasn't expired.
    */
   isStreamProfileRejected(channel: number, profile: StreamProfile): boolean {
-    return this._rejectedStreamProfiles.has(`${channel}:${profile}`);
+    const key = `${channel}:${profile}`;
+    const rejectedAt = this._rejectedStreamProfiles.get(key);
+    if (rejectedAt === undefined) return false;
+    if (Date.now() - rejectedAt > ReolinkBaichuanApi.REJECTED_STREAM_PROFILE_TTL_MS) {
+      this._rejectedStreamProfiles.delete(key);
+      return false;
+    }
+    return true;
   }
 
   /**
@@ -4918,6 +4940,25 @@ export class ReolinkBaichuanApi {
 
       for (const evt of events) {
         this.dispatchSimpleEvent(evt);
+
+        // A camera coming back online invalidates any stream-profile
+        // rejections recorded while it was disconnected — those 400s
+        // reflected "camera not connected," not genuine firmware limits.
+        if (evt.type === "online") {
+          let cleared = false;
+          for (const key of Array.from(this._rejectedStreamProfiles.keys())) {
+            if (key.startsWith(`${evt.channel}:`)) {
+              this._rejectedStreamProfiles.delete(key);
+              cleared = true;
+            }
+          }
+          if (cleared) {
+            this.videoStreamOptionsCache.clear();
+            this.logger.log?.(
+              `[ReolinkBaichuanApi] Cleared stream profile rejection(s) for channel=${evt.channel} after it came back online`,
+            );
+          }
+        }
       }
       this.channelPushData.set(entry.channel, next);
     }
@@ -9796,17 +9837,20 @@ export class ReolinkBaichuanApi {
 
         if (frame.header.responseCode !== 200) {
           // Mark the profile as rejected so buildVideoStreamOptions can
-          // exclude it and callers don't retry pointlessly.
+          // exclude it and callers don't retry pointlessly. A 400 here is
+          // frequently transient (mid-reconnect, camera briefly offline on
+          // an NVR channel), so this is a timed exclusion, not permanent —
+          // see isStreamProfileRejected/REJECTED_STREAM_PROFILE_TTL_MS.
           if (frame.header.responseCode === 400) {
             const rejKey = `${ch}:${profile}`;
             if (!this._rejectedStreamProfiles.has(rejKey)) {
-              this._rejectedStreamProfiles.add(rejKey);
+              this._rejectedStreamProfiles.set(rejKey, Date.now());
               // Invalidate cached stream options so the next call reflects the change.
               this.videoStreamOptionsCache.clear();
               this.logger?.warn?.(
                 `[ReolinkBaichuanApi] Stream profile rejected by device: channel=${ch} profile=${profile} (response_code 400). ` +
-                  `This profile will be excluded from available streams. ` +
-                  `The camera may not support this stream profile with the current firmware.`,
+                  `This profile will be excluded from available streams for ${Math.round(ReolinkBaichuanApi.REJECTED_STREAM_PROFILE_TTL_MS / 60_000)} minute(s), ` +
+                  `or until cleared by a reconnect/online event — whichever comes first.`,
               );
             }
           }
@@ -13371,9 +13415,9 @@ export class ReolinkBaichuanApi {
         // Preserve existing behavior: multifocal skips ext (and generally exposes only main/sub).
         if (isMultiFocal && profile === "ext") continue;
 
-        // Skip profiles that the device has explicitly rejected (e.g. ext returning 400).
-        if (this._rejectedStreamProfiles.has(`${params.channel}:${profile}`))
-          continue;
+        // Skip profiles that the device has explicitly rejected (e.g. ext returning 400),
+        // unless that rejection has since expired.
+        if (this.isStreamProfileRejected(params.channel, profile)) continue;
 
         if (params.includeRtsp && profile !== "ext") {
           const streamName = profile === "main" ? "main" : "sub";

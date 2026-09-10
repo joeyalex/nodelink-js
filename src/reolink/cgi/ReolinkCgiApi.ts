@@ -1486,8 +1486,14 @@ export class ReolinkCgiApi {
   }> {
     const channelsResponse = await this.GetChannelstatus();
     const status = channelsResponse?.[0]?.value?.status;
+    // A channel is kept if it has a UID *or* a name — some NVR/camera
+    // combinations report a channel with no UID (older devices, some
+    // firmware versions). Requiring UID unconditionally silently dropped
+    // those channels from discovery entirely; downstream matching (see
+    // syncEntitiesFromRemote's `uid || name || 'channel-${channel}'`) was
+    // already designed to handle a uid-less channel, so let it.
     let channels = (status ?? [])
-      .filter((s) => !!s?.uid)
+      .filter((s) => !!s?.uid || !!s?.name)
       .map((s) => Number(s?.channel))
       .filter((n) => Number.isFinite(n));
 

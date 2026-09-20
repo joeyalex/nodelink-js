@@ -1293,7 +1293,7 @@ export class ReolinkBaichuanApi {
   /** Failure count threshold before entering cooldown. */
   private static readonly SOCKET_POOL_FAILURE_THRESHOLD = 2;
   /** Time window (ms) to reset failure count if no failures occur. */
-  private static readonly SOCKET_POOL_FAILURE_WINDOW_MS = 60_000;
+  private static readonly SOCKET_POOL_FAILURE_WINDOW_MS = 300_000;
 
   /**
    * Get a summary of currently active sockets in the pool.
@@ -1903,6 +1903,8 @@ export class ReolinkBaichuanApi {
   }> {
     const log = logger ?? this.logger;
     const now = Date.now();
+    // References inherited from a dead pool entry that is being replaced.
+    let carriedRefCount = 0;
 
     // ─── Cooldown check: prevent session spam (login failures or D2C_DISC) ───
     const cooldownEntry = this.socketPoolCooldowns.get(this.host);
@@ -1985,6 +1987,28 @@ export class ReolinkBaichuanApi {
           log?.debug?.(
             `[SocketPool] Preempting active replay socket for tag=${tag}`,
           );
+          // Fall through to recreate
+        } else if (
+          !existing.client.isSocketConnected() ||
+          !existing.client.loggedIn
+        ) {
+          // The entry is still referenced, but the underlying connection is
+          // gone. Nothing evicts a pool entry when its socket closes, and the
+          // liveness check above only runs on the idle (refCount === 0) path,
+          // so without this every subsequent acquire hands back the same dead
+          // client and fails with "socket closed" until the plugin restarts.
+          // Recovery via refCount reaching 0 is not guaranteed: a holder that
+          // errors out without releasing pins the entry indefinitely.
+          log?.warn?.(
+            `[SocketPool] Active socket for tag=${tag} is dead ` +
+              `(refCount=${existing.refCount}, connected=${existing.client.isSocketConnected()}, ` +
+              `loggedIn=${existing.client.loggedIn}) — recreating`,
+          );
+          // Carry the existing references onto the replacement entry. Holders
+          // of the dead client release by tag, not by identity, so without
+          // this their releases would drive the fresh socket's refCount to 0
+          // and trip its idle-close timer while it is still in use.
+          carriedRefCount = existing.refCount;
           // Fall through to recreate
         } else {
           // For shared sockets (general, streaming), just reuse
@@ -2090,7 +2114,7 @@ export class ReolinkBaichuanApi {
         }
 
         entry.client = newClient;
-        entry.refCount = 1;
+        entry.refCount = 1 + carriedRefCount;
         entry.lastUsedAt = Date.now();
         delete entry.pendingPromise;
 
